@@ -107,6 +107,7 @@ async function runJob(job: JobQueueRow, result: DrainResult): Promise<void> {
 
     // Anything else: transient - retry with exponential backoff.
     const message = err instanceof Error ? err.message : String(err);
+    logger.error({ err, jobId: job.id, jobType: job.job_type }, 'Job failed and will be retried');
     debugLog('worker', 'error', 'job_retry', 'error', `Job errored (attempt ${job.attempts + 1}/${job.max_attempts}) - ${message}`, {
       jobId: job.id,
     });

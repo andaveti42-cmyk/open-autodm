@@ -219,6 +219,13 @@ test('session read error is retried rather than marked done as a missing session
   assert.equal(f.sends.length, 0);
 });
 
+test('temporary automation read error preserves the session and retries the requested link', async () => {
+  const f = fixture({ follow: true, failure: (table, action) => table === 'automations' && action === 'select' ? { message: 'temporary database error' } : null });
+  await assert.rejects(f.load('@/lib/automation/processJob').processFollowUpDmJob(f.payload), /Follow-up automation lookup failed/);
+  assert.equal(f.sends.length, 0);
+  assert.equal(f.session.completed, false);
+});
+
 test('null comment fields do not crash the webhook batch', async () => {
   const f = fixture();
   const base = { id: 'comment', from: { id: 'audience' }, media: { id: 'post' }, text: null };

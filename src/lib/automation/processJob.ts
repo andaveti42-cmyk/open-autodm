@@ -603,6 +603,8 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
   const db = createServiceClient();
   const env = getEnv();
 
+  logger.info({ sessionStep: payload.sessionStep ?? null }, 'Follow-up button job started');
+
   debugLog('worker', 'info', 'followup_started', 'processing', `Follow-up job started - step ${payload.sessionStep}`, {
     sessionId: payload.sessionId ?? null,
     sessionStep: payload.sessionStep ?? null,
@@ -650,13 +652,21 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
   }
 
   // ── 2: Load automation + account, breaker + rate limit ───────────────────
-  const { data: automation } = await db
+  const { data: automation, error: automationError } = await db
     .from('automations')
     .select('dm_responses, dm_opening_message_button_link, ask_to_follow_enabled, ask_to_follow_message, ask_to_follow_visit_profile_button, ask_to_follow_confirm_button')
     .eq('id', payload.automationId)
     .eq('is_active', true)
-    .single<AutomationRow>();
+    .maybeSingle<AutomationRow>();
+  if (automationError) {
+    // A temporary database error must not be mistaken for an inactive or
+    // missing automation. Returning here would complete the session and lose
+    // the link the person explicitly requested with the button tap.
+    logger.error({ err: automationError, sessionStep: payload.sessionStep ?? null }, 'Follow-up automation lookup failed; job will retry');
+    throw new Error(`Follow-up automation lookup failed: ${automationError.message}`);
+  }
   if (!automation) {
+    logger.warn({ sessionStep: payload.sessionStep ?? null }, 'Follow-up skipped because automation is missing or inactive');
     debugLog('worker', 'warn', 'automation_fetch', 'skipped', `Automation ${payload.automationId} inactive - completing session`, {});
     await db.from('automation_sessions').update({ completed: true }).eq('id', payload.sessionId);
     return;
@@ -771,6 +781,7 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
   // ── 4: Deliver dm_responses sequentially ─────────────────────────────────
   const responses = getFollowUpResponses(automation);
   if (!responses.length) {
+    logger.warn({ sessionStep: expectedStep }, 'Button tap found no follow-up response or link to send');
     debugLog('worker', 'warn', 'responses_send', 'skipped', 'Automation has 0 dm_responses - session completed with no content', {
       hint: 'Add at least one response (text or card) in the automation configuration',
     });
@@ -838,6 +849,12 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
       lastMessageText = lastMessageText || 'Message (delivery unconfirmed)';
     }
     deliveredCount += 1;
+    logger.info({
+      sessionStep: expectedStep,
+      responseIndex: idx + 1,
+      responseType: response.type,
+      hasLink: response.type !== 'card' && !!response.buttonLink?.trim(),
+    }, 'Follow-up response send completed');
     debugLog('worker', 'info', 'responses_send', 'ok', `Response ${idx + 1}/${responses.length} processed`, {
       responseIndex: idx + 1,
       type: response.type,
