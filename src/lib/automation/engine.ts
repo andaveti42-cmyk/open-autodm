@@ -31,12 +31,17 @@ export interface DrainResult {
 }
 
 export async function processDueJobs(limit: number): Promise<DrainResult> {
-  const jobs = await claimDueJobs(limit);
-  const result: DrainResult = { claimed: jobs.length, done: 0, rescheduled: 0, failed: 0 };
+  const result: DrainResult = { claimed: 0, done: 0, rescheduled: 0, failed: 0 };
+  const deadline = Date.now() + 40_000;
 
   // Sequential on purpose: preserves jitter spacing between sends and keeps a
   // single invocation from bursting DMs to Meta in parallel.
-  for (const job of jobs) {
+  // Claim only work we are about to run. Claiming 25 jobs up front can exceed
+  // the route's 60-second limit from jitter alone, stranding the rest locked.
+  while (result.claimed < limit && Date.now() < deadline) {
+    const [job] = await claimDueJobs(1);
+    if (!job) break;
+    result.claimed += 1;
     await runJob(job, result);
   }
 

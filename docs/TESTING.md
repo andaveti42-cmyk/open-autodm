@@ -78,6 +78,24 @@ The automation card's **Total DMs Sent** counter increments.
 
 ## Local development testing
 
+Run the isolated automation regressions before deploying:
+
+```bash
+npm ci
+npx tsc --noEmit
+node --test tests/automation.test.cjs
+```
+
+These tests execute the real processors with an in-memory database and simulated
+Meta responses. They cover ambiguous sends, preserved button sessions, link-only
+responses, username placeholders, malformed comments, session ownership and the
+queue drain time budget. They do not send Instagram messages or access a live DB.
+
+Meta codes 1/2 leave delivery **unconfirmed**. The worker preserves button state
+and avoids automatic resend, since a second send could duplicate the first one.
+This does not prove delivery. Previously deleted sessions are not restored by
+deploying the fix; verify the full flow with a fresh event after deployment.
+
 Meta needs a public HTTPS URL, so local testing uses a tunnel:
 
 ```bash

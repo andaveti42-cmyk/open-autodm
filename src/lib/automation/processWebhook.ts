@@ -95,6 +95,16 @@ async function processCommentEvent(
   comment: MetaCommentChangeValue,
   entryTime: number
 ): Promise<number> {
+  // Meta occasionally sends comment events without text (sticker/GIF/emoji-only)
+  // or without from/media. Never let a malformed event crash the whole batch.
+  if (!comment.from?.id || !comment.media?.id) {
+    debugLog('webhook', 'warn', 'comment_event', 'skipped', `Comment ${comment.id} has no author/media - ignored`, {
+      commentId: comment.id,
+    });
+    return 0;
+  }
+  const commentText = comment.text ?? '';
+
   // Only top-level comments trigger - replies are ignored (incl. our own replies)
   if (comment.parent_id) {
     debugLog('webhook', 'info', 'comment_event', 'skipped', `Comment ${comment.id} is a reply - ignored`, {
@@ -113,7 +123,7 @@ async function processCommentEvent(
   const triggerTimestamp = (comment.timestamp ?? entryTime) * 1000;
   const eventAgeMs = Date.now() - triggerTimestamp;
 
-  debugLog('webhook', 'info', 'comment_event', 'processing', `Comment received: "${comment.text.slice(0, 80)}"`, {
+  debugLog('webhook', 'info', 'comment_event', 'processing', `Comment received: "${commentText.slice(0, 80)}"`, {
     commentId: comment.id,
     commenterId: comment.from.id,
     commenterUsername: comment.from.username ?? null,
@@ -157,7 +167,7 @@ async function processCommentEvent(
       continue;
     }
 
-    if (!keywordMatches(comment.text, automation.keywords as string[] | null)) {
+    if (!keywordMatches(commentText, automation.keywords as string[] | null)) {
       debugLog('webhook', 'info', 'keyword_match', 'skipped', `Automation ${automation.id}: no keyword match`, {
         automationId: automation.id,
         keywords: automation.keywords ?? null,
@@ -179,7 +189,7 @@ async function processCommentEvent(
       triggerEventId: comment.id,
       triggerTimestamp,
       postId: comment.media.id,
-      commentText: comment.text,
+      commentText,
       messageText: null,
     };
 
@@ -256,13 +266,16 @@ async function processDmEvent(
         .from('automation_sessions')
         .select('id, automation_id, completed, expires_at')
         .eq('id', sessionId)
+        .eq('instagram_account_id', instagramAccountId)
+        .eq('audience_ig_user_id', messaging.sender.id)
         .maybeSingle();
 
       if (sessionError) {
         debugLog('webhook', 'error', 'session_lookup', 'error', `DB error fetching session: ${sessionError.message}`, {
           sessionId,
         });
-        // Fall through to keyword matching rather than dropping the event
+        // A session button must never trigger unrelated keyword automations.
+        throw new Error(`Session lookup failed: ${sessionError.message}`);
       } else if (!session) {
         debugLog('webhook', 'warn', 'session_lookup', 'skipped', `Session ${sessionId} not found - tap ignored`, { sessionId });
         return 0;
