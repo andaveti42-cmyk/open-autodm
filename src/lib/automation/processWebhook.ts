@@ -271,15 +271,18 @@ async function processDmEvent(
         .maybeSingle();
 
       if (sessionError) {
+        logger.error({ err: sessionError, sessionStep }, 'Button tap session lookup failed');
         debugLog('webhook', 'error', 'session_lookup', 'error', `DB error fetching session: ${sessionError.message}`, {
           sessionId,
         });
         // A session button must never trigger unrelated keyword automations.
         throw new Error(`Session lookup failed: ${sessionError.message}`);
       } else if (!session) {
+        logger.warn({ sessionStep }, 'Button tap ignored because its session was not found');
         debugLog('webhook', 'warn', 'session_lookup', 'skipped', `Session ${sessionId} not found - tap ignored`, { sessionId });
         return 0;
       } else if (session.completed || new Date(session.expires_at as string) < new Date()) {
+        logger.warn({ sessionStep, completed: !!session.completed }, 'Button tap ignored because its session is completed or expired');
         debugLog('webhook', 'info', 'session_lookup', 'skipped',
           `Session ${sessionId} is ${session.completed ? 'completed' : 'expired'} - tap ignored`, { sessionId });
         return 0;
@@ -300,6 +303,11 @@ async function processDmEvent(
           sessionStep,
         };
         const jobId = await enqueueJob('follow_up', followUpPayload, `followup_${sessionId}_${sessionStep}_${eventMid}`);
+        if (jobId) {
+          logger.info({ sessionStep, jobId }, 'Button tap queued for follow-up delivery');
+        } else {
+          logger.warn({ sessionStep }, 'Button tap was not queued (duplicate event or queue write failure)');
+        }
         debugLog('webhook', 'info', 'job_enqueued', jobId ? 'ok' : 'skipped', `Follow-up job ${jobId ? `enqueued (${jobId})` : 'duplicate - ignored'}`, {
           sessionId,
           sessionStep,
