@@ -37,18 +37,30 @@ import {
   type DmRecipient,
 } from '@/lib/instagram/api';
 import { updateContactProfile } from '@/lib/automation/contacts';
-import { MetaApiError, AccountPausedMetaError } from '@/lib/instagram/errors';
+import { getFollowUpResponses, hasResponseContent } from '@/lib/automation/responses';
+import { MetaApiError, AccountPausedMetaError, AmbiguousMetaError } from '@/lib/instagram/errors';
 
 /**
  * True when a failed button-template send should be retried as plain text
  * with an inline link. Template rejections surface as parameter/permission
- * errors; a policy block (368) must propagate so the circuit breaker opens
- * instead of immediately re-hitting Meta.
+ * errors (code 100). Rate limits, authentication errors, policy blocks and
+ * ambiguous outcomes must not trigger a second send.
  */
 function shouldFallBackToInlineLink(err: unknown): err is MetaApiError {
-  return err instanceof MetaApiError && !(err instanceof AccountPausedMetaError);
+  return err instanceof MetaApiError && err.code === 100;
 }
 import { renderTemplate } from '@/lib/automation/personalize';
+
+/** An uncertain send must preserve the state required by its visible button. */
+async function sendWithoutAmbiguousRetry(send: () => Promise<string>): Promise<void> {
+  try {
+    await send();
+  } catch (err) {
+    if (!(err instanceof AmbiguousMetaError)) throw err;
+    debugLog('worker', 'warn', 'followup_send', 'processing',
+      `Meta code ${err.code}: delivery unconfirmed; keeping the button state without retrying`, { code: err.code });
+  }
+}
 
 /** Sends a single configured response (text w/ optional link button, or card). */
 async function sendOneResponse(
@@ -72,7 +84,8 @@ async function sendOneResponse(
     return;
   }
 
-  const messageText = renderTemplate(response.content.trim(), username);
+  const messageText = renderTemplate(response.content?.trim() ?? '', username)
+    || response.buttonTitle?.trim() || 'Open link';
   const link = response.buttonLink?.trim();
   if (link) {
     const buttonTitle = response.buttonTitle?.trim() || 'Open link';
@@ -100,7 +113,7 @@ async function deliverResponsesBestEffort(
 ): Promise<number> {
   let sent = 0;
   for (const [idx, response] of responses.entries()) {
-    if (!response.content?.trim() && response.type !== 'card') continue;
+    if (!hasResponseContent(response)) continue;
     try {
       if (sent > 0) await interMessageJitter();
       await sendOneResponse(
@@ -355,7 +368,7 @@ export async function processAutoDmJob(payload: AutoDmJobPayload, attempt: numbe
   if (!automation.dm_opening_message_enabled || !automation.dm_opening_message.trim()) {
     // Opening message is off - the FIRST response becomes the initial DM.
     const responses = automation.dm_responses ?? [];
-    const firstResponse = responses.find((r) => r.content?.trim() || r.type === 'card');
+    const firstResponse = responses.find(hasResponseContent);
     if (!firstResponse) {
       debugLog('worker', 'info', 'opening_dm', 'skipped', 'Opening DM disabled and no responses configured - nothing to send', {});
       await markJobStatus(db, payload, 'skipped', 'DM disabled');
@@ -383,8 +396,14 @@ export async function processAutoDmJob(payload: AutoDmJobPayload, attempt: numbe
         accessToken
       );
     } catch (err) {
-      await markJobStatus(db, payload, 'failed', err instanceof Error ? err.message : String(err));
-      throw err;
+      if (err instanceof AmbiguousMetaError) {
+        // Meta answered 500/code 1 but usually delivered anyway - do NOT retry (duplicate DM).
+        debugLog('worker', 'warn', 'opening_dm', 'processing',
+          `Meta returned code ${err.code} - delivery unconfirmed, treating as sent (no retry)`, { code: err.code });
+      } else {
+        await markJobStatus(db, payload, 'failed', err instanceof Error ? err.message : String(err));
+        throw err;
+      }
     }
 
     const { error: directLogError } = await db.from('dm_sent_log').insert({
@@ -430,10 +449,10 @@ export async function processAutoDmJob(payload: AutoDmJobPayload, attempt: numbe
         await markJobStatus(db, payload, 'skipped', 'Session already active');
         return;
       }
-      logger.warn({ err: sessionError }, 'Session insert failed - degrading to plain DM');
-      debugLog('worker', 'warn', 'session_create', 'error', 'Session insert failed - sending plain DM without button', {
+      debugLog('worker', 'error', 'session_create', 'error', 'Session insert failed - delaying DM until its button can be routed', {
         error: sessionError.message,
       });
+      throw new Error(`Session creation failed: ${sessionError.message}`);
     } else {
       sessionId = session.id as string;
       quickReplyPayload = `SESSION_${sessionId}_STEP_1`;
@@ -494,12 +513,25 @@ export async function processAutoDmJob(payload: AutoDmJobPayload, attempt: numbe
       messageId = await sendInstagramDm(payload.igAccountIgsid, recipient, messageText, accessToken);
     }
   } catch (err) {
-    // Orphaned session cleanup on hard failures - the engine classifies the error
-    if (sessionId) {
-      await db.from('automation_sessions').delete().eq('id', sessionId);
+    if (err instanceof AmbiguousMetaError) {
+      // Meta answered 500/code 1|2 but very often delivers the DM anyway.
+      // Retrying would send duplicates, and deleting the session would break the
+      // button the user already holds ("Send me the link" -> "session not found").
+      // So: keep the session, do not retry, record the send.
+      messageId = 'unconfirmed';
+      debugLog('worker', 'warn', 'opening_dm', 'processing',
+        `Meta returned code ${err.code} - delivery unconfirmed, treating as sent (no retry, session kept)`, {
+          code: err.code,
+          sessionId,
+        });
+    } else {
+      // Definitive failure: the message was NOT delivered, so the session is an orphan.
+      if (sessionId) {
+        await db.from('automation_sessions').delete().eq('id', sessionId);
+      }
+      await markJobStatus(db, payload, 'failed', err instanceof Error ? err.message : String(err));
+      throw err;
     }
-    await markJobStatus(db, payload, 'failed', err instanceof Error ? err.message : String(err));
-    throw err;
   }
 
   // ── 9: Record the send ───────────────────────────────────────────────────
@@ -583,14 +615,21 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
   }
 
   // ── 1: Verify session ────────────────────────────────────────────────────
-  const { data: session } = await db
+  const { data: session, error: sessionError } = await db
     .from('automation_sessions')
     .select('id, automation_id, instagram_account_id, audience_ig_user_id, current_step, expires_at, completed')
     .eq('id', payload.sessionId)
     .maybeSingle();
 
+  if (sessionError) throw new Error(`Session lookup failed: ${sessionError.message}`);
   if (!session) {
     debugLog('worker', 'warn', 'session_verify', 'error', `Session ${payload.sessionId} not found`, {});
+    return;
+  }
+  if (session.instagram_account_id !== payload.instagramAccountId
+    || session.audience_ig_user_id !== payload.triggerUserId
+    || session.automation_id !== payload.automationId) {
+    debugLog('worker', 'warn', 'session_verify', 'skipped', 'Session does not belong to this account, audience member or automation', {});
     return;
   }
   if (session.completed as boolean) {
@@ -665,13 +704,13 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
 
     if (follows === false) {
       const confirmPayload = `SESSION_${payload.sessionId}_STEP_2`;
-      await sendAskToFollowDm(payload.igAccountIgsid, payload.triggerUserId, accessToken, {
+      await sendWithoutAmbiguousRetry(() => sendAskToFollowDm(payload.igAccountIgsid, payload.triggerUserId, accessToken, {
         message: automation.ask_to_follow_message,
         creatorUsername: igAccount.username ?? '',
         visitProfileButtonTitle: automation.ask_to_follow_visit_profile_button,
         confirmButtonTitle: automation.ask_to_follow_confirm_button,
         confirmPayload,
-      });
+      }));
 
       await db
         .from('automation_sessions')
@@ -705,12 +744,12 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
     if (follows === false) {
       // Still not following - nudge and keep the session at step 2 so the
       // card's buttons stay live and they can tap "I'm following" again.
-      await sendInstagramDm(
+      await sendWithoutAmbiguousRetry(() => sendInstagramDm(
         payload.igAccountIgsid,
         { id: payload.triggerUserId },
         `Hmm, I still can't see your follow 👀 Tap "${automation.ask_to_follow_visit_profile_button}" above, hit Follow, then tap "${automation.ask_to_follow_confirm_button}" again 🙏`,
         accessToken
-      );
+      ));
       await db
         .from('automation_sessions')
         .update({ last_activity_at: new Date().toISOString() })
@@ -730,7 +769,8 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
   }
 
   // ── 4: Deliver dm_responses sequentially ─────────────────────────────────
-  if (!automation.dm_responses?.length) {
+  const responses = getFollowUpResponses(automation);
+  if (!responses.length) {
     debugLog('worker', 'warn', 'responses_send', 'skipped', 'Automation has 0 dm_responses - session completed with no content', {
       hint: 'Add at least one response (text or card) in the automation configuration',
     });
@@ -738,58 +778,67 @@ export async function processFollowUpDmJob(payload: AutoDmJobPayload): Promise<v
     return;
   }
 
-  debugLog('worker', 'info', 'responses_send', 'processing', `Sending ${automation.dm_responses.length} response(s) to ${payload.triggerUserId}`, {
+  debugLog('worker', 'info', 'responses_send', 'processing', `Sending ${responses.length} response(s) to ${payload.triggerUserId}`, {
     sessionId: payload.sessionId,
-    responseCount: automation.dm_responses.length,
+    responseCount: responses.length,
   });
 
   let lastMessageText = '';
   let deliveredCount = 0;
-  for (const [idx, response] of automation.dm_responses.entries()) {
-    if (!response.content?.trim() && response.type !== 'card') continue;
+  for (const [idx, response] of responses.entries()) {
     if (deliveredCount > 0) await interMessageJitter();
 
-    if (response.type === 'card') {
-      const cardImageUrl = response.cardImage?.startsWith('http') ? response.cardImage : undefined;
-      await sendInstagramCardDm(payload.igAccountIgsid, payload.triggerUserId, accessToken, {
-        title: response.cardTitle ?? response.content,
-        ...(cardImageUrl !== undefined ? { imageUrl: cardImageUrl } : {}),
-        ...(response.cardSubtitle !== undefined ? { subtitle: response.cardSubtitle } : {}),
-        ...(response.cardButtons !== undefined
-          ? { buttons: response.cardButtons.map((b) => ({ title: b.title, url: b.link })) }
-          : {}),
-      });
-      lastMessageText = response.cardTitle ?? response.content ?? 'Card message';
-    } else {
-      const messageText = renderTemplate(response.content.trim(), payload.triggerUsername);
-      const link = response.buttonLink?.trim();
-      if (link) {
-        // Tappable link button first; inline-link fallback if Meta rejects it.
-        const buttonTitle = response.buttonTitle?.trim() || 'Open link';
-        try {
-          await sendInstagramLinkButtonDm(
-            payload.igAccountIgsid,
-            { id: payload.triggerUserId },
-            messageText,
-            buttonTitle,
-            link,
-            accessToken
-          );
-          lastMessageText = messageText;
-        } catch (buttonErr) {
-          if (!shouldFallBackToInlineLink(buttonErr)) throw buttonErr;
-          debugLog('worker', 'warn', 'responses_send', 'processing', 'Link button rejected - falling back to inline link', {});
-          const fallback = `${messageText}\n\n${buttonTitle}: ${link}`;
-          await sendInstagramDm(payload.igAccountIgsid, { id: payload.triggerUserId }, fallback, accessToken);
-          lastMessageText = fallback;
-        }
+    try {
+      if (response.type === 'card') {
+        const cardImageUrl = response.cardImage?.startsWith('http') ? response.cardImage : undefined;
+        await sendInstagramCardDm(payload.igAccountIgsid, payload.triggerUserId, accessToken, {
+          title: response.cardTitle ?? response.content,
+          ...(cardImageUrl !== undefined ? { imageUrl: cardImageUrl } : {}),
+          ...(response.cardSubtitle !== undefined ? { subtitle: response.cardSubtitle } : {}),
+          ...(response.cardButtons !== undefined
+            ? { buttons: response.cardButtons.map((b) => ({ title: b.title, url: b.link })) }
+            : {}),
+        });
+        lastMessageText = response.cardTitle ?? response.content ?? 'Card message';
       } else {
-        await sendInstagramDm(payload.igAccountIgsid, { id: payload.triggerUserId }, messageText, accessToken);
-        lastMessageText = messageText;
+        const messageText = renderTemplate(response.content?.trim() ?? '', payload.triggerUsername)
+          || response.buttonTitle?.trim() || 'Open link';
+        const link = response.buttonLink?.trim();
+        if (link) {
+          // Tappable link button first; inline-link fallback if Meta rejects it.
+          const buttonTitle = response.buttonTitle?.trim() || 'Open link';
+          try {
+            await sendInstagramLinkButtonDm(
+              payload.igAccountIgsid,
+              { id: payload.triggerUserId },
+              messageText,
+              buttonTitle,
+              link,
+              accessToken
+            );
+            lastMessageText = messageText;
+          } catch (buttonErr) {
+            if (!shouldFallBackToInlineLink(buttonErr)) throw buttonErr;
+            debugLog('worker', 'warn', 'responses_send', 'processing', 'Link button rejected - falling back to inline link', {});
+            const fallback = `${messageText}\n\n${buttonTitle}: ${link}`;
+            await sendInstagramDm(payload.igAccountIgsid, { id: payload.triggerUserId }, fallback, accessToken);
+            lastMessageText = fallback;
+          }
+        } else {
+          await sendInstagramDm(payload.igAccountIgsid, { id: payload.triggerUserId }, messageText, accessToken);
+          lastMessageText = messageText;
+        }
       }
+    } catch (err) {
+      if (!(err instanceof AmbiguousMetaError)) throw err;
+      // Meta 500/code 1: usually delivered anyway. A retry would re-send the
+      // responses that already went out (duplicate links) - count it as delivered.
+      debugLog('worker', 'warn', 'responses_send', 'processing',
+        `Response ${idx + 1} - Meta code ${err.code}, delivery unconfirmed, treating as sent`, { code: err.code });
+      lastMessageText = lastMessageText || 'Message (delivery unconfirmed)';
     }
     deliveredCount += 1;
-    debugLog('worker', 'info', 'responses_send', 'ok', `Response ${idx + 1}/${automation.dm_responses.length} sent`, {
+    debugLog('worker', 'info', 'responses_send', 'ok', `Response ${idx + 1}/${responses.length} processed`, {
       responseIndex: idx + 1,
       type: response.type,
     });
